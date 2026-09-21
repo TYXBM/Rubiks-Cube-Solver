@@ -131,7 +131,4 @@ a provably shortest answer. Other positions use Kociemba's two-phase method and
 normally solve in about 20 moves. The two-phase method produces very short
 solutions, but is not guaranteed to be mathematically optimal for every cube.
 
-## License
 
-No license has been selected yet. Add a license before accepting outside
-contributions or allowing others to reuse the project.
