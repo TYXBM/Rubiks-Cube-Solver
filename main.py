@@ -3,11 +3,16 @@ import sys
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
+from panda3d.core import AntialiasAttrib, loadPrcFileData
+from PIL import Image, ImageDraw
 from ursina import (
     Button,
     Entity,
+    Quad,
+    Shader,
     Slider,
     Text,
+    Texture,
     Ursina,
     Vec3,
     camera,
@@ -25,23 +30,33 @@ import solver
 BLANK = "-"  # a sticker you have not painted yet
 
 STICKER_COLOUR = {
-    cube.YELLOW: color.hex("#f5d130"),
-    cube.WHITE: color.hex("#f4f4f4"),
-    cube.GREEN: color.hex("#1aa64b"),
-    cube.BLUE: color.hex("#1f5ed0"),
-    cube.ORANGE: color.hex("#eb811b"),
-    cube.RED: color.hex("#cd2233"),
-    BLANK: color.hex("#c2c8d0"),
+    cube.YELLOW: color.hex("#f7cd2e"),
+    cube.WHITE: color.hex("#f3f4f1"),
+    cube.GREEN: color.hex("#16a352"),
+    cube.BLUE: color.hex("#1f5fd4"),
+    cube.ORANGE: color.hex("#f2771f"),
+    cube.RED: color.hex("#d2263d"),
+    BLANK: color.hex("#c4c9d1"),  # pale grey: reads as blank, never as white
 }
-PAINT_ORDER = (cube.YELLOW, cube.WHITE, cube.GREEN, cube.BLUE, cube.ORANGE, cube.RED)
+PAINT_ORDER = (cube.WHITE, cube.YELLOW, cube.GREEN, cube.BLUE, cube.RED, cube.ORANGE)
 
-BODY_COLOUR = color.hex("#0e1013")
-BACKGROUND = color.hex("#181c22")
-PANEL_TEXT = color.hex("#d7dde5")
-DIM_TEXT = color.hex("#8892a0")
-ACCENT = color.hex("#f5d130")
-BUTTON_COLOUR = color.hex("#252b34")
+BODY_COLOUR = color.hex("#111318")
+BACKGROUND = color.hex("#0d1014")
+CARD_COLOUR = color.hex("#171b22")
+CARD_EDGE = color.hex("#262c36")
+PILL_COLOUR = color.hex("#171b22")
+PANEL_TEXT = color.hex("#e3e7ee")
+DIM_TEXT = color.hex("#8a93a2")
+LABEL_TEXT = color.hex("#5f6878")
+ACCENT = color.hex("#f7cd2e")  # the big next-move letter
+PRIMARY = color.hex("#3567e8")  # solve and apply buttons
+SECONDARY = color.hex("#28355a")  # step by step: related to solving, quieter
+BUTTON_COLOUR = color.hex("#262c37")
+TRACK_COLOUR = color.hex("#2a303b")
 WARNING = color.hex("#ff9a8a")
+
+MOVE_FONT = "VeraMono.ttf"  # monospaced, so the move grid lines up in columns
+MAX_GRID_MOVES = 24
 
 COLOUR_NAMES = {
     cube.YELLOW: "yellow",
@@ -86,6 +101,10 @@ else:
     print("solver: NOT READY. Run 'python solver.py --build-tables' once (about half")
     print("        an hour) to generate the pruning tables it needs.")
 
+# 4x multisampling smooths the jagged, flickering pixels along the cube's edges.
+# Has to be configured before the window opens.
+loadPrcFileData("", "framebuffer-multisample 1\nmultisamples 4")
+
 app = Ursina(
     title="Rubik's Cube Solver",
     size=(1280, 720),
@@ -93,13 +112,111 @@ app = Ursina(
     vsync=not SELF_CHECK,  # the self check steps frames as fast as it can
     development_mode=False,
 )
+app.render.setAntialias(AntialiasAttrib.MMultisample)
 window.color = BACKGROUND
 window.fps_counter.enabled = False
 window.entity_counter.enabled = False
 window.collider_counter.enabled = False
 
-camera.position = (0, 0, -10)
+CAMERA_DISTANCE = 14.5  # far enough that the cube sits between the two side panels
+ZOOM_NEAREST, ZOOM_FARTHEST = 8.0, 24.0
+camera.position = (0, 0, -CAMERA_DISTANCE)
 camera.rotation = (0, 0, 0)
+
+
+# Soft directional lighting.  The camera never moves, so a light fixed in world
+# space behaves like a studio light: faces turned towards the upper left are
+# brightest, faces turned away fall into shade, and the cube reads as a solid
+# object instead of flat paper.  Colour still comes from Entity.color, so the
+# model's sticker colours are untouched.
+cube_shader = Shader(
+    name="cube_shader",
+    language=Shader.GLSL,
+    vertex="""
+#version 140
+uniform mat4 p3d_ModelViewProjectionMatrix;
+uniform mat4 p3d_ModelMatrix;
+in vec4 p3d_Vertex;
+in vec3 p3d_Normal;
+in vec2 p3d_MultiTexCoord0;
+in vec4 p3d_Color;
+out vec2 uvs;
+out vec3 world_normal;
+out vec4 vertex_color;
+void main() {
+    gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+    uvs = p3d_MultiTexCoord0;
+    world_normal = normalize(mat3(p3d_ModelMatrix) * p3d_Normal);
+    vertex_color = p3d_Color;
+}
+""",
+    fragment="""
+#version 140
+uniform sampler2D p3d_Texture0;
+uniform vec4 p3d_ColorScale;
+in vec2 uvs;
+in vec3 world_normal;
+in vec4 vertex_color;
+out vec4 fragColor;
+void main() {
+    vec4 base = texture(p3d_Texture0, uvs) * p3d_ColorScale * vertex_color;
+    if (base.a < 0.5) discard;  // rounded sticker corners
+    vec3 n = normalize(world_normal);
+    float key = max(dot(n, normalize(vec3(-0.30, 0.60, -0.74))), 0.0);
+    float fill = max(dot(n, normalize(vec3(0.75, 0.0, -0.66))), 0.0);
+    float shade = min(1.0, 0.62 + 0.38 * key + 0.20 * fill);
+    fragColor = vec4(base.rgb * shade, 1.0);
+}
+""",
+)
+
+
+def _supersampled(size, draw, scale=4):
+    """Draw at `scale` times the size and shrink, for smooth anti-aliased edges."""
+    big = Image.new("RGBA", (size[0] * scale, size[1] * scale), (0, 0, 0, 0))
+    draw(ImageDraw.Draw(big), scale)
+    return big.resize(size, Image.LANCZOS)
+
+
+# rounded square sticker: white inside, transparent corners, tinted by .color
+STICKER_TEXTURE = Texture(
+    _supersampled(
+        (128, 128),
+        lambda d, s: d.rounded_rectangle(
+            (0, 0, 128 * s - 1, 128 * s - 1), radius=26 * s, fill=(255, 255, 255, 255)
+        ),
+    )
+)
+
+
+def _backdrop_texture():
+    """A soft radial glow behind the cube, fading to the window colour."""
+    w, h = 320, 180
+    image = Image.new("RGB", (w, h))
+    pixels = image.load()
+    centre = (0x1f, 0x26, 0x31)
+    edge = (0x0d, 0x10, 0x14)
+    for y in range(h):
+        for x in range(w):
+            dx, dy = (x - w / 2) / (w / 2), (y - h / 2) / (h / 2)
+            t = min(1.0, (dx * dx * 0.55 + dy * dy) ** 0.5)
+            t = t * t * (3 - 2 * t)
+            pixels[x, y] = tuple(round(c + (e - c) * t) for c, e in zip(centre, edge))
+    return Texture(image)
+
+
+# Parented to the camera and placed well behind the cube, so it fills the view
+# at any zoom level.  The camera's horizontal field of view is 40 degrees.
+_BACKDROP_DEPTH = 80
+_backdrop_width = 2 * _BACKDROP_DEPTH * 0.364 * 1.15  # tan(20 degrees), plus margin
+Entity(
+    parent=camera,
+    model="quad",
+    texture=_backdrop_texture(),
+    shader=unlit_shader,
+    z=_BACKDROP_DEPTH,
+    scale=(_backdrop_width, _backdrop_width / window.aspect_ratio),
+)
 
 
 def to_render(vec):
@@ -222,18 +339,21 @@ class Simulator:
                 parent=self.root,
                 model="cube",
                 color=BODY_COLOUR,
-                shader=unlit_shader,
+                shader=cube_shader,
                 position=Vec3(*to_render(pos)),
-                scale=0.96,
+                scale=0.97,
             )
             self.cubies[pos] = cubie
             for direction in cube.DIRS_AT[pos]:
-                scale = [0.84, 0.84, 0.84]
-                scale[next(i for i in range(3) if direction[i])] = 0.06
+                # nearly flat: a thicker box shows its textured sides as thin
+                # coloured lines along every sticker edge
+                scale = [0.86, 0.86, 0.86]
+                scale[next(i for i in range(3) if direction[i])] = 0.002
                 sticker = Entity(
                     parent=cubie,
                     model="cube",
-                    shader=unlit_shader,
+                    shader=cube_shader,
+                    texture=STICKER_TEXTURE,
                     color=color.black,
                     position=Vec3(*to_render(direction)) * 0.5,
                     scale=Vec3(*scale),
@@ -242,168 +362,288 @@ class Simulator:
                 self.stickers[index] = sticker
                 self.sticker_index[sticker] = index
 
+    # -- interface layout ---------------------------------------------------- #
+    #
+    # Three columns: a control card on the left, the cube in the middle, and a
+    # moves card on the right that only appears when there is something to show.
+    # camera.ui spans x = -0.889 .. 0.889 and y = -0.5 .. 0.5 at 16:9.
+
+    LEFT_X, RIGHT_X = -0.70, 0.70  # card centres
+    CARD_WIDTH = 0.34
+    CONTENT_WIDTH = 0.30
+    BUTTON_HEIGHT = 0.054
+
+    @staticmethod
+    def _card(x, top=0.475, bottom=-0.475, width=CARD_WIDTH):
+        """A rounded panel with a one pixel border, drawn behind everything else."""
+        height = top - bottom
+        y = (top + bottom) / 2
+        pieces = []
+        for grow, colour, depth in ((0.003, CARD_EDGE, 0.31), (0.0, CARD_COLOUR, 0.30)):
+            w, h = width + grow, height + grow
+            pieces.append(
+                Entity(
+                    parent=camera.ui,
+                    model=Quad(radius=0.03, aspect=w / h),
+                    color=colour,
+                    position=(x, y, depth),
+                    scale=(w, h),
+                )
+            )
+        return pieces
+
+    @staticmethod
+    def _label(text, x, y, colour=LABEL_TEXT, scale=0.58, origin=(-0.5, 0.5), **kwargs):
+        return Text(
+            text,
+            parent=camera.ui,
+            position=(x, y),
+            origin=origin,
+            color=colour,
+            scale=scale,
+            **kwargs,
+        )
+
+    def _button(self, label, action, y, x=LEFT_X, width=CONTENT_WIDTH, colour=BUTTON_COLOUR):
+        return Button(
+            text=label,
+            parent=camera.ui,
+            position=(x, y),
+            scale=(width, self.BUTTON_HEIGHT),
+            color=colour,
+            text_color=PANEL_TEXT,
+            text_size=0.78,
+            radius=0.28,
+            on_click=action,
+        )
+
     def _build_ui(self):
+        left = self.LEFT_X
+        content_left = left - self.CONTENT_WIDTH / 2
+        content_right = left + self.CONTENT_WIDTH / 2
+        half = (self.CONTENT_WIDTH - 0.01) / 2  # two buttons side by side
+
+        self.left_card = self._card(left, bottom=-0.325)  # hugs its contents
         self.title = Text(
             "RUBIK'S CUBE SOLVER",
             parent=camera.ui,
-            position=(-0.86, 0.46),
+            position=(content_left, 0.448),
             origin=(-0.5, 0.5),
             color=PANEL_TEXT,
-            scale=1.4,
+            scale=1.1,
+        )
+        self.title_rule = Entity(
+            parent=camera.ui,
+            model=Quad(radius=0.5, aspect=10),
+            color=PRIMARY,
+            position=(content_left + 0.025, 0.401),
+            scale=(0.05, 0.005),
         )
 
-        def add_button(label, action, y):
-            return Button(
-                text=label,
-                parent=camera.ui,
-                position=(-0.74, y),
-                scale=(0.26, 0.06),
-                color=BUTTON_COLOUR,
-                text_size=0.8,
-                radius=0.25,
-                on_click=action,
-            )
+        cube_label = self._label("CUBE", content_left, 0.372)
+        solve_label = self._label("SOLVE", content_left, 0.218)
+        speed_label = self._label("Speed", content_left, 0.128, colour=DIM_TEXT, scale=0.64)
+        self.speed_value = self._label(
+            "", content_right, 0.128, colour=PANEL_TEXT, scale=0.64, origin=(0.5, 0.5)
+        )
 
         self.buttons = [
-            add_button("Scramble", self.on_scramble, 0.37),
-            add_button("Enter colours", self.on_enter_colours, 0.295),
-            add_button("Solve (auto play)", self.on_solve_auto, 0.22),
-            add_button("Solve (step by step)", self.on_solve_step, 0.06),
-            add_button("Stop", self.on_stop, -0.015),
-            add_button("Reset", self.on_reset, -0.09),
+            self._button("Scramble", self.on_scramble, 0.328),
+            self._button("Enter colours", self.on_enter_colours, 0.266),
+            self._button("Solve (auto play)", self.on_solve_auto, 0.172, colour=PRIMARY),
+            self._button("Solve (step by step)", self.on_solve_step, 0.042, colour=SECONDARY),
+            self._button(
+                "Stop", self.on_stop, -0.020, x=content_left + half / 2, width=half
+            ),
+            self._button(
+                "Reset", self.on_reset, -0.020, x=content_right - half / 2, width=half
+            ),
         ]
 
-        self.speed_label = Text(
-            "auto play speed, moves per second",
-            parent=camera.ui,
-            position=(-0.86, 0.172),
-            origin=(-0.5, 0.5),
-            color=DIM_TEXT,
-            scale=0.62,
-        )
         self.speed_slider = Slider(
             min=AUTO_SPEED_MIN,
             max=AUTO_SPEED_MAX,
             default=AUTO_SPEED_DEFAULT,
             dynamic=True,
-            position=(-0.855, 0.135),
-            scale=0.62,
+            position=(content_left + 0.004, 0.094),
+            scale=(self.CONTENT_WIDTH - 0.008) / 0.525,
+            bar_color=TRACK_COLOUR,
             on_value_changed=self.refresh_text,
         )
+        self.speed_slider.knob.text_entity.enabled = False  # shown in speed_value
+        paint_button(self.speed_slider.knob, PANEL_TEXT)
 
+        self.controls_rule = Entity(
+            parent=camera.ui,
+            model="quad",
+            color=CARD_EDGE,
+            position=(left, -0.074, 0.2),
+            scale=(self.CONTENT_WIDTH, 0.0015),
+        )
+        controls_label = self._label("CONTROLS", content_left, -0.098)
         self.help_texts = [
             Text(
                 body,
                 parent=camera.ui,
-                position=(-0.86, y),
+                position=(content_left, y),
                 origin=(-0.5, 0.5),
                 color=DIM_TEXT,
-                scale=0.7,
+                scale=0.66,
             )
             for body, y in (
-                ("DRAG to rotate", -0.17),
-                ("SCROLL to zoom in and out", -0.235),
+                ("DRAG to rotate", -0.138),
+                ("SCROLL to zoom in and out", -0.188),
                 (
                     "ENTER KEY squares up to the\n"
                     "nearest face, then use the\n"
                     "ARROW KEYS to switch faces",
-                    -0.30,
+                    -0.238,
                 ),
             )
         ]
 
-        self.move_text = Text(
-            "", parent=camera.ui, position=(0, 0.46), origin=(0, 0.5), color=ACCENT, scale=2.2
-        )
+        # status lines above and below the cube, each on its own rounded pill
         self.top_text = Text(
-            "", parent=camera.ui, position=(0, 0.39), origin=(0, 0.5), color=PANEL_TEXT, scale=0.85
+            "", parent=camera.ui, position=(0, 0.448), origin=(0, 0), color=PANEL_TEXT, scale=0.8
         )
         self.bottom_text = Text(
-            "", parent=camera.ui, position=(0, -0.42), origin=(0, 0.5), color=PANEL_TEXT, scale=0.85
-        )
-        self.next_text = Text(
-            "",
-            parent=camera.ui,
-            position=(0.44, 0.33),
-            origin=(-0.5, 0.5),
-            color=PANEL_TEXT,
-            scale=0.72,
-            line_height=1.3,
+            "", parent=camera.ui, position=(0, -0.448), origin=(0, 0), color=PANEL_TEXT, scale=0.8
         )
 
+        self._build_moves_panel()
+
         self.main_ui = [
-            self.speed_label,
+            cube_label,
+            solve_label,
+            speed_label,
+            self.speed_value,
             self.speed_slider,
-            self.next_text,
+            self.controls_rule,
+            controls_label,
             *self.help_texts,
             *self.buttons,
         ]
 
-    def _build_paint_ui(self):
-        """The colour picker, in the left column where the buttons normally are.
+    def _build_moves_panel(self):
+        right = self.RIGHT_X
+        content_left = right - self.CONTENT_WIDTH / 2
+        self.moves_left = content_left
 
-        Top level entities like every other button here, rather than children of
-        one container: ursina hides a disabled entity's whole subtree, but these
-        are simple enough that there is nothing to gain from nesting them.
+        self.right_card = []
+        self.right_card_bottom = None
+        self.next_label = self._label("", content_left, 0.448)
+        self.move_text = Text(
+            "",
+            parent=camera.ui,
+            position=(content_left, 0.428),
+            origin=(-0.5, 0.5),
+            color=ACCENT,
+            scale=3.4,
+        )
+        self.progress_text = self._label("", content_left, 0.300, colour=DIM_TEXT, scale=0.66)
+        self.progress_track = Entity(
+            parent=camera.ui,
+            model="quad",
+            color=TRACK_COLOUR,
+            position=(right, 0.262, 0.02),
+            scale=(self.CONTENT_WIDTH, 0.008),
+        )
+        self.progress_fill = Entity(
+            parent=camera.ui,
+            model="quad",
+            origin_x=-0.5,
+            color=PRIMARY,
+            position=(content_left, 0.262, 0.01),
+            scale=(0.0001, 0.008),
+        )
+        self.upcoming_label = self._label("UPCOMING", content_left, 0.222)
+        self.next_text = Text(
+            "",
+            parent=camera.ui,
+            position=(content_left, 0.188),
+            origin=(-0.5, 0.5),
+            color=PANEL_TEXT,
+            scale=0.9,
+            line_height=1.5,
+            font=MOVE_FONT,
+        )
+        self.right_panel = [
+            self.next_label,
+            self.move_text,
+            self.progress_text,
+            self.progress_track,
+            self.progress_fill,
+            self.upcoming_label,
+            self.next_text,
+        ]
+
+    def _build_paint_ui(self):
+        """The colour picker, in the left card where the buttons normally are.
+
+        Top level entities like every other control here, rather than children
+        of one container, so each can be shown and hidden on its own.
         """
+        left = self.LEFT_X
+        content_left = left - self.CONTENT_WIDTH / 2
+        content_right = left + self.CONTENT_WIDTH / 2
+        half = (self.CONTENT_WIDTH - 0.01) / 2
         self.paint_ui = []
         self.swatches = {}
 
-        heading = Text(
-            "PAINT YOUR CUBE",
-            parent=camera.ui,
-            position=(-0.86, 0.37),
-            origin=(-0.5, 0.5),
-            color=PANEL_TEXT,
-            scale=0.95,
-        )
-        instructions = Text(
-            "click a colour, then click the\nstickers on the cube itself\n"
-            "drag, enter and the arrow keys\nturn it around",
-            parent=camera.ui,
-            position=(-0.86, 0.33),
-            origin=(-0.5, 0.5),
-            color=DIM_TEXT,
-            scale=0.65,
+        heading = self._label("PAINT YOUR CUBE", content_left, 0.372)
+        instructions = self._label(
+            "Pick a colour, then click the\n"
+            "stickers on the cube. Drag,\n"
+            "Enter and the arrow keys turn\n"
+            "it to reach the other faces.",
+            content_left,
+            0.338,
+            colour=DIM_TEXT,
+            scale=0.64,
         )
         self.paint_ui += [heading, instructions]
 
         self.paint_highlight = Entity(
-            parent=camera.ui, model="quad", color=PANEL_TEXT, scale=(0.085, 0.072), z=0.01
+            parent=camera.ui,
+            model=Quad(radius=0.24, aspect=0.093 / 0.079),
+            color=PRIMARY,
+            scale=(0.093, 0.079),
+            z=0.01,
         )
         self.paint_ui.append(self.paint_highlight)
 
         for i, colour in enumerate(PAINT_ORDER):
-            x = -0.83 + (i % 3) * 0.085
-            y = 0.17 - (i // 3) * 0.075
+            x = left + ((i % 3) - 1) * 0.1
+            y = 0.205 - (i // 3) * 0.088
             swatch = Button(
                 parent=camera.ui,
-                model="quad",
-                scale=(0.075, 0.062),
+                scale=(0.08, 0.066),
                 position=(x, y),
+                radius=0.22,
                 on_click=partial(self.choose_colour, colour),
             )
             paint_button(swatch, STICKER_COLOUR[colour])
             self.swatches[colour] = swatch
             self.paint_ui.append(swatch)
 
-        def add_button(label, action, y):
-            button = Button(
-                text=label,
-                parent=camera.ui,
-                position=(-0.74, y),
-                scale=(0.26, 0.06),
-                color=BUTTON_COLOUR,
-                text_size=0.8,
-                radius=0.25,
-                on_click=action,
-            )
-            self.paint_ui.append(button)
-            return button
+        self.paint_selected = self._label("", content_left, 0.064, colour=PANEL_TEXT, scale=0.66)
+        self.paint_ui.append(self.paint_selected)
 
-        self.apply_button = add_button("Apply", self.apply_colours, -0.01)
-        add_button("Clear all", self.clear_colours, -0.085)
-        add_button("Cancel", self.cancel_colours, -0.16)
+        self.apply_button = self._button("Apply", self.apply_colours, 0.002, colour=PRIMARY)
+        clear_button = self._button(
+            "Clear all", self.clear_colours, -0.060, x=content_left + half / 2, width=half
+        )
+        cancel_button = self._button(
+            "Cancel", self.cancel_colours, -0.060, x=content_right - half / 2, width=half
+        )
+        note = self._label(
+            "The six centres are fixed:\nwhite on top, green in front.",
+            content_left,
+            -0.112,
+            colour=DIM_TEXT,
+            scale=0.64,
+        )
+        self.paint_ui += [self.apply_button, clear_button, cancel_button, note]
 
         for entity in self.paint_ui:
             entity.enabled = False
@@ -442,46 +682,106 @@ class Simulator:
             )
         return None
 
-    def refresh_text(self):
-        if self.editing:
-            self.move_text.text = ""
-            self.top_text.text = PAINT_HINT
-            self.bottom_text.text = self.bottom_message
+    def _set_pill(self, text_entity, value):
+        """Show `value` on a rounded dark pill, or hide both if it is empty."""
+        if getattr(text_entity, "_pill_text", None) == value:
             return
+        text_entity._pill_text = value
+        text_entity.text = value
+        if text_entity.background_entity:
+            destroy(text_entity.background_entity)
+            text_entity.background_entity = None
+        if value:
+            text_entity.create_background(
+                padding=(Text.size * 2.4, Text.size * 1.3), radius=0.5, color=PILL_COLOUR
+            )
 
-        step = self._waiting_step()
-        self.move_text.text = step.move if step else ""
-        self.top_text.text = self.top_message
-
-        parts = [self.bottom_message] if self.bottom_message else []
-        if step and step.total:
-            parts.append(f"move {step.index} of {step.total}")
-        if self.mode == self.AUTO and (self.queue or self.current):
-            parts.append(f"{self.speed_slider.value:.1f} moves/sec")
-        self.bottom_text.text = "     ".join(parts)
-
-        self.next_text.text = self._next_lines()
+    def refresh_text(self):
+        self.speed_value.text = f"{self.speed_slider.value:.1f} moves/s"
+        if self.editing:
+            self._set_pill(self.top_text, PAINT_HINT)
+            self._set_pill(self.bottom_text, self.bottom_message)
+            self._show_moves_panel(False)
+            return
+        self._set_pill(self.top_text, self.top_message)
+        self._set_pill(self.bottom_text, self.bottom_message)
+        self._update_moves_panel(self._waiting_step())
 
     @staticmethod
-    def _in_rows(moves, per_row=8):
+    def _in_rows(moves, per_row=5):
         rows = [moves[i : i + per_row] for i in range(0, len(moves), per_row)]
         return "\n".join("  ".join(f"{m:<2}" for m in row) for row in rows)
 
-    def _next_lines(self):
+    GRID_ROW_HEIGHT = 0.034  # one line of the move grid, in camera.ui units
+
+    def _show_moves_panel(self, visible):
+        for entity in self.right_panel + self.right_card:
+            entity.enabled = visible
+
+    def _fit_moves_card(self, grid_top, rows):
+        """Size the right card to its contents rather than the full height."""
+        bottom = round(min(grid_top - rows * self.GRID_ROW_HEIGHT - 0.035, 0.30), 3)
+        if bottom == self.right_card_bottom:
+            return
+        for entity in self.right_card:
+            destroy(entity)
+        self.right_card = self._card(self.RIGHT_X, bottom=bottom)
+        self.right_card_bottom = bottom
+
+    def _upcoming_after(self, step):
+        """The moves still to come after the one shown in large type."""
         if self.mode == self.STEP and self.solution:
-            upcoming = self.solution[self.cursor :][:32]
-        else:
-            upcoming = [step.move for step in list(self.queue)[:32]]
-            if self.current:
-                upcoming.insert(0, self.current.move)
-        if upcoming:
-            return "NEXT MOVES\n\n" + self._in_rows(upcoming)
+            busy = self.current is not None or bool(self.queue)
+            return self.solution[self.cursor if busy else self.cursor + 1 :]
+        queued = [s.move for s in self.queue]
+        return queued if self.current else queued[1:]
+
+    def _update_moves_panel(self, step):
+        stepping_done = step is None and self.mode == self.STEP and bool(self.solution)
+
+        if step is not None or stepping_done:
+            self._show_moves_panel(True)
+            total = (step.total if step else 0) or len(self.solution or [])
+            if step is not None:
+                self.next_label.text = "NOW PLAYING" if self.mode == self.AUTO else "NEXT MOVE"
+                self.move_text.text = step.move
+                index = step.index or 1
+                self.progress_text.text = f"Move {index} of {total}" if total else ""
+                done = (index - 1) / total if total else 0.0
+                upcoming = self._upcoming_after(step)
+            else:
+                self.next_label.text = "SOLVED"
+                self.move_text.text = "Done"
+                self.progress_text.text = f"All {total} moves played"
+                done = 1.0
+                upcoming = []
+            self.progress_text.y = 0.300
+            self.progress_track.enabled = self.progress_fill.enabled = bool(total)
+            self.progress_fill.scale_x = max(0.0001, self.CONTENT_WIDTH * done)
+            self.upcoming_label.enabled = bool(upcoming)
+            self.next_text.y = 0.188
+            shown = upcoming[:MAX_GRID_MOVES]
+            self.next_text.text = self._in_rows(shown)
+            rows = -(-len(shown) // 5)
+            self._fit_moves_card(0.188 if rows else 0.262, rows)
+            return
+
         if self.scramble_sequence:
-            return (
-                "SCRAMBLE\nturn a real cube with this to\nmatch the one on screen:\n\n"
-                + self._in_rows(self.scramble_sequence)
+            self._show_moves_panel(True)
+            self.next_label.text = "SCRAMBLE"
+            self.move_text.enabled = False
+            self.progress_text.text = (
+                "Apply these moves to a solved\ncube to match the one on screen."
             )
-        return ""
+            self.progress_text.y = 0.414
+            self.progress_track.enabled = self.progress_fill.enabled = False
+            self.upcoming_label.enabled = False
+            self.next_text.y = 0.350
+            self.next_text.text = self._in_rows(self.scramble_sequence)
+            self._fit_moves_card(0.350, -(-len(self.scramble_sequence) // 5))
+            return
+
+        self._show_moves_panel(False)
 
     # cube painting 
 
@@ -510,6 +810,7 @@ class Simulator:
         self.paint_colour = colour
         swatch = self.swatches[colour]
         self.paint_highlight.position = (swatch.x, swatch.y, 0.01)
+        self.paint_selected.text = f"Selected: {COLOUR_NAMES[colour].capitalize()}"
 
     def paint_sticker(self, index):
         if self.paint_state[index] == self.paint_colour:
@@ -882,9 +1183,9 @@ class Simulator:
         elif key == "left mouse up":
             self.on_release()
         elif key == "scroll up":
-            camera.z = min(-5.0, camera.z + 0.5)
+            camera.z = min(-ZOOM_NEAREST, camera.z + 0.5)
         elif key == "scroll down":
-            camera.z = max(-17.0, camera.z - 0.5)
+            camera.z = max(-ZOOM_FARTHEST, camera.z - 0.5)
         elif key in self.ENTER_KEYS:
             self.look_at_face(self.nearest_face())
         elif key in self.ARROW_DIRECTIONS:

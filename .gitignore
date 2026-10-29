@@ -1,0 +1,28 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated logs and temporary validation output
+*.log
+*_check.txt
+
+# Local archive; publish the active project only
+Rubiks cube v1/
+
+# RubikTwoPhase tables are stored outside this project by default. Ignore them
+# if RUBIKS_TABLE_FOLDER is overridden to a path under the repository.
+twophase/
